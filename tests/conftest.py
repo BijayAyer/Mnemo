@@ -3,6 +3,7 @@
 import os
 os.environ["EMBEDDER"] = "fake"
 os.environ["LLM"] = "mock"
+os.environ.setdefault("GRAPH_BACKEND", "none")
 os.environ["SUMMARY_THRESHOLD"] = "5"
 
 import httpx

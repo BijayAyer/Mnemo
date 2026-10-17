@@ -10,7 +10,7 @@ import uuid
 from datetime import datetime, timezone
 from typing import Any
 
-from fastapi import APIRouter, Depends, Header, HTTPException, Request
+from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request
 from fastapi.responses import StreamingResponse
 
 from ..auth import get_db, hash_key, require_admin, tenant_context
@@ -20,6 +20,7 @@ from ..coordination.locks import lease_is_active
 from ..config import settings
 from ..db import Database
 from ..embeddings import embed
+from ..graph import GraphStore, get_graph, write_through
 from ..llm import get_llm
 from ..models import BlackboardIn, EpisodeIn, FactIn, HandoffIn, LeaseIn, MessageIn, ProcedureIn, RecallIn, TenantContext
 from ..memory.consolidation import successful_groups
@@ -69,7 +70,7 @@ async def tenant_index(db: Database, tenant_id: str) -> TenantIndex:
     return index
 
 
-async def upsert_fact(db: Database, ctx: TenantContext, data: FactIn, source_episode_id: str | None = None) -> dict:
+async def upsert_fact(db: Database, ctx: TenantContext, data: FactIn, graph: GraphStore, source_episode_id: str | None = None) -> dict:
     stamp, new_id = now(), ident()
     async with db.lock:
         await db.conn.execute("BEGIN IMMEDIATE")
@@ -81,7 +82,9 @@ async def upsert_fact(db: Database, ctx: TenantContext, data: FactIn, source_epi
             if current and current["object"] == data.object:
                 await db.conn.execute("UPDATE facts SET confidence=? WHERE tenant_id=? AND id=?", (data.confidence, ctx.tenant_id, current["id"]))
                 await db.conn.commit()
-                return dict(await db.fetchone("SELECT * FROM facts WHERE tenant_id=? AND id=?", (ctx.tenant_id, current["id"])))
+                result = dict(await db.fetchone("SELECT * FROM facts WHERE tenant_id=? AND id=?", (ctx.tenant_id, current["id"])))
+                await write_through(graph, "upsert_fact", ctx.tenant_id, result)
+                return result
             if current:
                 await db.conn.execute("UPDATE facts SET valid_to=?,superseded_by=? WHERE tenant_id=? AND id=?", (stamp, new_id, ctx.tenant_id, current["id"]))
             await db.conn.execute(
@@ -93,7 +96,12 @@ async def upsert_fact(db: Database, ctx: TenantContext, data: FactIn, source_epi
             await db.conn.rollback()
             raise
     put_vector(ctx.tenant_id, new_id, f"{data.subject} {data.predicate} {data.object}")
-    return rowdict(await db.fetchone("SELECT * FROM facts WHERE tenant_id=? AND id=?", (ctx.tenant_id, new_id)))
+    result = rowdict(await db.fetchone("SELECT * FROM facts WHERE tenant_id=? AND id=?", (ctx.tenant_id, new_id)))
+    if current:
+        old_fact = dict(await db.fetchone("SELECT * FROM facts WHERE tenant_id=? AND id=?", (ctx.tenant_id, current["id"])))
+        await write_through(graph, "upsert_fact", ctx.tenant_id, old_fact)
+    await write_through(graph, "upsert_fact", ctx.tenant_id, result, current["id"] if current else None)
+    return result
 
 
 @router.post("/admin/tenants", dependencies=[Depends(require_admin)])
@@ -116,10 +124,11 @@ async def issue_tenant_key(tenant_id: str, body: dict, db: Database = Depends(ge
 
 
 @router.post("/v1/episodes", status_code=201)
-async def create_episode(body: EpisodeIn, request: Request, ctx: TenantContext = Depends(tenant_context), db: Database = Depends(get_db)):
+async def create_episode(body: EpisodeIn, request: Request, ctx: TenantContext = Depends(tenant_context), db: Database = Depends(get_db), graph: GraphStore = Depends(get_graph)):
     item_id, stamp = ident(), now()
     await db.insert("INSERT INTO episodes(id,tenant_id,user_id,agent_id,session_id,ts,event_type,content,outcome,importance,embedding_id) VALUES(?,?,?,?,?,?,?,?,?,?,?)", (item_id, ctx.tenant_id, body.user_id, ctx.agent_id, body.session_id, stamp, body.event_type, body.content, body.outcome, body.importance, item_id))
     put_vector(ctx.tenant_id, item_id, body.content)
+    await write_through(graph, "upsert_episode", ctx.tenant_id, dict(await db.fetchone("SELECT * FROM episodes WHERE tenant_id=? AND id=?", (ctx.tenant_id, item_id))))
     await audit(db, ctx, "episode.create", item_id)
     return {"id": item_id, "tenant_id": ctx.tenant_id, "agent_id": ctx.agent_id, "ts": stamp, **body.model_dump()}
 
@@ -147,18 +156,21 @@ async def get_episode(episode_id: str, ctx: TenantContext = Depends(tenant_conte
 
 
 @router.patch("/v1/episodes/{episode_id}")
-async def update_episode(episode_id: str, body: dict, ctx: TenantContext = Depends(tenant_context), db: Database = Depends(get_db)):
+async def update_episode(episode_id: str, body: dict, ctx: TenantContext = Depends(tenant_context), db: Database = Depends(get_db), graph: GraphStore = Depends(get_graph)):
     changed = await db.execute("UPDATE episodes SET content=COALESCE(?,content),importance=COALESCE(?,importance),outcome=COALESCE(?,outcome) WHERE tenant_id=? AND id=?", (body.get("content"), body.get("importance"), body.get("outcome"), ctx.tenant_id, episode_id))
     if not changed:
         raise HTTPException(404, "Episode not found")
-    return rowdict(await db.fetchone("SELECT * FROM episodes WHERE tenant_id=? AND id=?", (ctx.tenant_id, episode_id)))
+    result = rowdict(await db.fetchone("SELECT * FROM episodes WHERE tenant_id=? AND id=?", (ctx.tenant_id, episode_id)))
+    await write_through(graph, "upsert_episode", ctx.tenant_id, result)
+    return result
 
 
 @router.delete("/v1/episodes/{episode_id}")
-async def delete_episode(episode_id: str, ctx: TenantContext = Depends(tenant_context), db: Database = Depends(get_db)):
+async def delete_episode(episode_id: str, ctx: TenantContext = Depends(tenant_context), db: Database = Depends(get_db), graph: GraphStore = Depends(get_graph)):
     changed = await db.execute("UPDATE episodes SET archived=1 WHERE tenant_id=? AND id=?", (ctx.tenant_id, episode_id))
     if not changed:
         raise HTTPException(404, "Episode not found")
+    await write_through(graph, "upsert_episode", ctx.tenant_id, dict(await db.fetchone("SELECT * FROM episodes WHERE tenant_id=? AND id=?", (ctx.tenant_id, episode_id))))
     return {"archived": True}
 
 @router.post("/v1/episodes/search")
@@ -177,8 +189,8 @@ async def search_episodes(body: dict, ctx: TenantContext = Depends(tenant_contex
 
 
 @router.post("/v1/facts", status_code=201)
-async def create_fact(body: FactIn, ctx: TenantContext = Depends(tenant_context), db: Database = Depends(get_db)):
-    return await upsert_fact(db, ctx, body)
+async def create_fact(body: FactIn, ctx: TenantContext = Depends(tenant_context), db: Database = Depends(get_db), graph: GraphStore = Depends(get_graph)):
+    return await upsert_fact(db, ctx, body, graph)
 
 
 @router.get("/v1/facts")
@@ -201,6 +213,28 @@ async def search_facts(body: dict, ctx: TenantContext = Depends(tenant_context),
     return ranked[:min(max(int(body.get("limit", 10)), 1), 100)]
 
 
+@router.get("/v1/graph/neighbors")
+async def graph_neighbors(user_id: str | None = None, depth: int = Query(default=3, ge=1, le=3), ctx: TenantContext = Depends(tenant_context), graph: GraphStore = Depends(get_graph)):
+    try:
+        return await graph.neighbors(ctx.tenant_id, user_id, depth=depth)
+    except Exception:
+        log.exception("Graph neighbor query failed", extra={"tenant_id": ctx.tenant_id})
+        return {"available": False, "nodes": [], "edges": []}
+
+
+@router.get("/v1/graph/provenance/{fact_id}")
+async def graph_provenance(fact_id: str, ctx: TenantContext = Depends(tenant_context), db: Database = Depends(get_db), graph: GraphStore = Depends(get_graph)):
+    fact = await db.fetchone("SELECT id FROM facts WHERE tenant_id=? AND id=?", (ctx.tenant_id, fact_id))
+    if not fact:
+        raise HTTPException(404, "Fact not found")
+    try:
+        chain = await graph.provenance(ctx.tenant_id, fact_id)
+    except Exception:
+        log.exception("Graph provenance query failed", extra={"tenant_id": ctx.tenant_id, "fact_id": fact_id})
+        return {"available": False, "fact_id": fact_id, "chain": []}
+    return {"available": graph.available, "fact_id": fact_id, "chain": chain}
+
+
 @router.get("/v1/facts/{fact_id}/history")
 async def fact_history(fact_id: str, ctx: TenantContext = Depends(tenant_context), db: Database = Depends(get_db)):
     row = await db.fetchone("SELECT user_id,subject,predicate FROM facts WHERE tenant_id=? AND id=?", (ctx.tenant_id, fact_id))
@@ -211,18 +245,19 @@ async def fact_history(fact_id: str, ctx: TenantContext = Depends(tenant_context
 
 
 @router.put("/v1/facts/{fact_id}")
-async def update_fact(fact_id: str, body: FactIn, ctx: TenantContext = Depends(tenant_context), db: Database = Depends(get_db)):
+async def update_fact(fact_id: str, body: FactIn, ctx: TenantContext = Depends(tenant_context), db: Database = Depends(get_db), graph: GraphStore = Depends(get_graph)):
     row = await db.fetchone("SELECT id FROM facts WHERE tenant_id=? AND id=?", (ctx.tenant_id, fact_id))
     if not row:
         raise HTTPException(404, "Fact not found")
-    return await upsert_fact(db, ctx, body)
+    return await upsert_fact(db, ctx, body, graph)
 
 
 @router.delete("/v1/facts/{fact_id}")
-async def close_fact(fact_id: str, ctx: TenantContext = Depends(tenant_context), db: Database = Depends(get_db)):
+async def close_fact(fact_id: str, ctx: TenantContext = Depends(tenant_context), db: Database = Depends(get_db), graph: GraphStore = Depends(get_graph)):
     changed = await db.execute("UPDATE facts SET valid_to=? WHERE tenant_id=? AND id=? AND valid_to IS NULL", (now(), ctx.tenant_id, fact_id))
     if not changed:
         raise HTTPException(404, "Fact not found")
+    await write_through(graph, "upsert_fact", ctx.tenant_id, dict(await db.fetchone("SELECT * FROM facts WHERE tenant_id=? AND id=?", (ctx.tenant_id, fact_id))))
     return {"closed": True}
 
 
@@ -233,7 +268,7 @@ async def blackboard_delete(key: str, ctx: TenantContext = Depends(tenant_contex
         raise HTTPException(404, "Key not found")
     return {"deleted": True}
 @router.post("/v1/facts/extract")
-async def extract_facts(body: dict, ctx: TenantContext = Depends(tenant_context), db: Database = Depends(get_db)):
+async def extract_facts(body: dict, ctx: TenantContext = Depends(tenant_context), db: Database = Depends(get_db), graph: GraphStore = Depends(get_graph)):
     text = str(body.get("text", ""))
     user_id = str(body.get("user_id", "unknown"))
     response = await get_llm().complete(f"Extract user facts as JSON array of subject,predicate,object from this text: {text}")
@@ -245,29 +280,32 @@ async def extract_facts(body: dict, ctx: TenantContext = Depends(tenant_context)
     result = []
     for fact in parsed:
         if all(key in fact for key in ("subject", "predicate", "object")):
-            result.append(await upsert_fact(db, ctx, FactIn(user_id=user_id, **fact)))
+            result.append(await upsert_fact(db, ctx, FactIn(user_id=user_id, **fact), graph))
     return result
 
 
 @router.delete("/v1/handoffs/{handoff_id}")
-async def delete_handoff(handoff_id: str, ctx: TenantContext = Depends(tenant_context), db: Database = Depends(get_db)):
+async def delete_handoff(handoff_id: str, ctx: TenantContext = Depends(tenant_context), db: Database = Depends(get_db), graph: GraphStore = Depends(get_graph)):
     changed = await db.execute("DELETE FROM handoffs WHERE tenant_id=? AND id=? AND from_agent=? AND status='pending'", (ctx.tenant_id, handoff_id, ctx.agent_id))
     if not changed:
         raise HTTPException(404, "Handoff not found")
+    await write_through(graph, "delete_handoff", ctx.tenant_id, handoff_id)
     return {"deleted": True}
 
 
 @router.delete("/v1/procedures/{procedure_id}")
-async def delete_procedure(procedure_id: str, ctx: TenantContext = Depends(tenant_context), db: Database = Depends(get_db)):
+async def delete_procedure(procedure_id: str, ctx: TenantContext = Depends(tenant_context), db: Database = Depends(get_db), graph: GraphStore = Depends(get_graph)):
     changed = await db.execute("UPDATE procedures SET is_active=0 WHERE tenant_id=? AND id=? AND is_active=1", (ctx.tenant_id, procedure_id))
     if not changed:
         raise HTTPException(404, "Procedure not found")
+    await write_through(graph, "upsert_procedure", ctx.tenant_id, dict(await db.fetchone("SELECT * FROM procedures WHERE tenant_id=? AND id=?", (ctx.tenant_id, procedure_id))))
     return {"archived": True}
 @router.post("/v1/procedures", status_code=201)
-async def create_procedure(body: ProcedureIn, ctx: TenantContext = Depends(tenant_context), db: Database = Depends(get_db)):
+async def create_procedure(body: ProcedureIn, ctx: TenantContext = Depends(tenant_context), db: Database = Depends(get_db), graph: GraphStore = Depends(get_graph)):
     item_id = ident()
     await db.insert("INSERT INTO procedures(id,tenant_id,name,trigger_text,steps_json,version,updated_at) VALUES(?,?,?,?,?,1,?)", (item_id, ctx.tenant_id, body.name, body.trigger_text, json.dumps(body.steps), now()))
     put_vector(ctx.tenant_id, item_id, body.trigger_text)
+    await write_through(graph, "upsert_procedure", ctx.tenant_id, dict(await db.fetchone("SELECT * FROM procedures WHERE tenant_id=? AND id=?", (ctx.tenant_id, item_id))))
     return {"id": item_id, **body.model_dump(), "version": 1, "is_active": True}
 
 
@@ -285,7 +323,7 @@ async def get_procedure(procedure_id: str, ctx: TenantContext = Depends(tenant_c
 
 
 @router.put("/v1/procedures/{procedure_id}")
-async def update_procedure(procedure_id: str, body: ProcedureIn, ctx: TenantContext = Depends(tenant_context), db: Database = Depends(get_db)):
+async def update_procedure(procedure_id: str, body: ProcedureIn, ctx: TenantContext = Depends(tenant_context), db: Database = Depends(get_db), graph: GraphStore = Depends(get_graph)):
     old = await db.fetchone("SELECT * FROM procedures WHERE tenant_id=? AND id=? AND is_active=1", (ctx.tenant_id, procedure_id))
     if not old:
         raise HTTPException(404, "Procedure not found")
@@ -295,6 +333,8 @@ async def update_procedure(procedure_id: str, body: ProcedureIn, ctx: TenantCont
         ("INSERT INTO procedures(id,tenant_id,name,trigger_text,steps_json,version,success_count,failure_count,is_active,updated_at) VALUES(?,?,?,?,?,?,?,?,1,?)", (new_id, ctx.tenant_id, body.name, body.trigger_text, json.dumps(body.steps), old["version"] + 1, old["success_count"], old["failure_count"], now())),
     ])
     put_vector(ctx.tenant_id, new_id, body.trigger_text)
+    await write_through(graph, "upsert_procedure", ctx.tenant_id, dict(await db.fetchone("SELECT * FROM procedures WHERE tenant_id=? AND id=?", (ctx.tenant_id, procedure_id))))
+    await write_through(graph, "upsert_procedure", ctx.tenant_id, dict(await db.fetchone("SELECT * FROM procedures WHERE tenant_id=? AND id=?", (ctx.tenant_id, new_id))))
     return {"id": new_id, **body.model_dump(), "version": old["version"] + 1}
 
 
@@ -308,12 +348,16 @@ async def match_procedures(body: dict, ctx: TenantContext = Depends(tenant_conte
 
 
 @router.post("/v1/procedures/{procedure_id}/outcome")
-async def procedure_outcome(procedure_id: str, body: dict, ctx: TenantContext = Depends(tenant_context), db: Database = Depends(get_db)):
+async def procedure_outcome(procedure_id: str, body: dict, ctx: TenantContext = Depends(tenant_context), db: Database = Depends(get_db), graph: GraphStore = Depends(get_graph)):
     field = "success_count" if body.get("success") else "failure_count"
     changed = await db.execute(f"UPDATE procedures SET {field}={field}+1 WHERE tenant_id=? AND id=? AND is_active=1", (ctx.tenant_id, procedure_id))
     if not changed:
         raise HTTPException(404, "Procedure not found")
-    return rowdict(await db.fetchone("SELECT * FROM procedures WHERE tenant_id=? AND id=?", (ctx.tenant_id, procedure_id)))
+    await db.insert("INSERT OR IGNORE INTO procedure_usage(tenant_id,procedure_id,agent_id,first_used_at) VALUES(?,?,?,?)", (ctx.tenant_id, procedure_id, ctx.agent_id, now()))
+    result = rowdict(await db.fetchone("SELECT * FROM procedures WHERE tenant_id=? AND id=?", (ctx.tenant_id, procedure_id)))
+    usage = await db.fetchall("SELECT agent_id FROM procedure_usage WHERE tenant_id=? AND procedure_id=?", (ctx.tenant_id, procedure_id))
+    await write_through(graph, "upsert_procedure", ctx.tenant_id, {**result, "used_by_agent_ids": [row["agent_id"] for row in usage]})
+    return result
 
 
 @router.post("/v1/messages", status_code=201)
@@ -346,9 +390,28 @@ async def get_history(user_id: str, session_id: str, limit: int | None = None, c
 
 
 @router.post("/v1/recall")
-async def recall(body: RecallIn, ctx: TenantContext = Depends(tenant_context), db: Database = Depends(get_db)):
+async def recall(body: RecallIn, ctx: TenantContext = Depends(tenant_context), db: Database = Depends(get_db), graph: GraphStore = Depends(get_graph)):
     facts = await search_facts({"query": body.query, "user_id": body.user_id, "limit": 10}, ctx, db)
     episodes = await search_episodes({"query": body.query, "user_id": body.user_id, "limit": 10}, ctx, db)
+    if graph.available:
+        seed_ids = [item["id"] for item in (*facts, *episodes)]
+        if seed_ids:
+            try:
+                related = await graph.neighbors(ctx.tenant_id, body.user_id, seed_ids=seed_ids, depth=3)
+                fact_ids = list(dict.fromkeys(node["id"] for node in related["nodes"] if "Fact" in node.get("labels", []) and node.get("id")))
+                episode_ids = list(dict.fromkeys(node["id"] for node in related["nodes"] if "Episode" in node.get("labels", []) and node.get("id")))
+                existing_facts = {item["id"] for item in facts}
+                existing_episodes = {item["id"] for item in episodes}
+                if fact_ids:
+                    placeholders = ",".join("?" for _ in fact_ids)
+                    rows = await db.fetchall(f"SELECT * FROM facts WHERE tenant_id=? AND user_id=? AND valid_to IS NULL AND id IN ({placeholders})", (ctx.tenant_id, body.user_id, *fact_ids))
+                    facts.extend({**dict(row), "related": True} for row in rows if row["id"] not in existing_facts)
+                if episode_ids:
+                    placeholders = ",".join("?" for _ in episode_ids)
+                    rows = await db.fetchall(f"SELECT * FROM episodes WHERE tenant_id=? AND user_id=? AND archived=0 AND id IN ({placeholders})", (ctx.tenant_id, body.user_id, *episode_ids))
+                    episodes.extend({**dict(row), "related": True} for row in rows if row["id"] not in existing_episodes)
+            except Exception:
+                log.exception("Graph recall expansion failed; returning vector results", extra={"tenant_id": ctx.tenant_id})
     procedures = await match_procedures({"situation": body.query}, ctx, db)
     history = await get_history(body.user_id, body.session_id, 8, ctx, db) if body.session_id else {"summary": None, "messages": []}
     handoffs = await db.fetchall("SELECT * FROM handoffs WHERE tenant_id=? AND to_agent=? AND status='pending' AND user_id=?", (ctx.tenant_id, ctx.agent_id, body.user_id))
@@ -421,7 +484,7 @@ async def blackboard_list(prefix: str = "", ctx: TenantContext = Depends(tenant_
 
 
 @router.post("/v1/handoffs", status_code=201)
-async def create_handoff(body: HandoffIn, ctx: TenantContext = Depends(tenant_context), db: Database = Depends(get_db)):
+async def create_handoff(body: HandoffIn, ctx: TenantContext = Depends(tenant_context), db: Database = Depends(get_db), graph: GraphStore = Depends(get_graph)):
     item_id, stamp = ident(), now()
     summary = body.summary
     if not summary:
@@ -436,6 +499,7 @@ async def create_handoff(body: HandoffIn, ctx: TenantContext = Depends(tenant_co
         facts = await db.fetchall("SELECT id FROM facts WHERE tenant_id=? AND user_id=? AND valid_to IS NULL ORDER BY valid_from DESC LIMIT 5", (ctx.tenant_id, body.user_id))
         memory_refs = [row["id"] for row in (*episodes, *facts)]
     await db.insert("INSERT INTO handoffs(id,tenant_id,from_agent,to_agent,user_id,session_id,summary,memory_refs_json,open_tasks_json,status,created_at) VALUES(?,?,?,?,?,?,?,?,?,'pending',?)", (item_id, ctx.tenant_id, ctx.agent_id, body.to_agent, body.user_id, body.session_id, summary, json.dumps(memory_refs), json.dumps(body.open_tasks), stamp))
+    await write_through(graph, "upsert_handoff", ctx.tenant_id, dict(await db.fetchone("SELECT * FROM handoffs WHERE tenant_id=? AND id=?", (ctx.tenant_id, item_id))))
     return {"id": item_id, "status": "pending", **body.model_dump(exclude={"summary", "memory_refs"}), "summary": summary, "memory_refs": memory_refs, "from_agent": ctx.agent_id, "created_at": stamp}
 
 
@@ -453,19 +517,23 @@ async def get_handoff(handoff_id: str, ctx: TenantContext = Depends(tenant_conte
 
 
 @router.post("/v1/handoffs/{handoff_id}/accept")
-async def accept_handoff(handoff_id: str, ctx: TenantContext = Depends(tenant_context), db: Database = Depends(get_db)):
+async def accept_handoff(handoff_id: str, ctx: TenantContext = Depends(tenant_context), db: Database = Depends(get_db), graph: GraphStore = Depends(get_graph)):
     changed = await db.execute("UPDATE handoffs SET status='accepted',accepted_at=? WHERE tenant_id=? AND id=? AND to_agent=? AND status='pending'", (now(), ctx.tenant_id, handoff_id, ctx.agent_id))
     if not changed:
         raise HTTPException(404, "Handoff not found")
-    return rowdict(await db.fetchone("SELECT * FROM handoffs WHERE tenant_id=? AND id=?", (ctx.tenant_id, handoff_id)))
+    result = rowdict(await db.fetchone("SELECT * FROM handoffs WHERE tenant_id=? AND id=?", (ctx.tenant_id, handoff_id)))
+    await write_through(graph, "upsert_handoff", ctx.tenant_id, result)
+    return result
 
 
 @router.post("/v1/handoffs/{handoff_id}/complete")
-async def complete_handoff(handoff_id: str, ctx: TenantContext = Depends(tenant_context), db: Database = Depends(get_db)):
+async def complete_handoff(handoff_id: str, ctx: TenantContext = Depends(tenant_context), db: Database = Depends(get_db), graph: GraphStore = Depends(get_graph)):
     changed = await db.execute("UPDATE handoffs SET status='completed' WHERE tenant_id=? AND id=? AND to_agent=? AND status='accepted'", (ctx.tenant_id, handoff_id, ctx.agent_id))
     if not changed:
         raise HTTPException(404, "Handoff not found")
-    return rowdict(await db.fetchone("SELECT * FROM handoffs WHERE tenant_id=? AND id=?", (ctx.tenant_id, handoff_id)))
+    result = rowdict(await db.fetchone("SELECT * FROM handoffs WHERE tenant_id=? AND id=?", (ctx.tenant_id, handoff_id)))
+    await write_through(graph, "upsert_handoff", ctx.tenant_id, result)
+    return result
 
 
 @router.post("/v1/leases/acquire")
@@ -500,7 +568,7 @@ async def lease_release(body: LeaseIn, ctx: TenantContext = Depends(tenant_conte
 
 
 @router.post("/v1/consolidate")
-async def consolidate(ctx: TenantContext = Depends(tenant_context), db: Database = Depends(get_db)):
+async def consolidate(ctx: TenantContext = Depends(tenant_context), db: Database = Depends(get_db), graph: GraphStore = Depends(get_graph)):
     episodes = await db.fetchall("SELECT * FROM episodes WHERE tenant_id=? AND archived=0 ORDER BY ts DESC LIMIT 100", (ctx.tenant_id,))
     report = {"episodes_scanned": len(episodes), "facts_added": 0, "facts_merged": 0, "procedures_created": 0, "archived": 0, "procedures_flagged": []}
     for episode in episodes[:20]:
@@ -510,7 +578,7 @@ async def consolidate(ctx: TenantContext = Depends(tenant_context), db: Database
             facts = json.loads(raw[raw.find("["):raw.rfind("]") + 1])
             for fact in facts:
                 if all(key in fact for key in ("subject", "predicate", "object")):
-                    await upsert_fact(db, ctx, FactIn(user_id=episode["user_id"], **fact), episode["id"])
+                    await upsert_fact(db, ctx, FactIn(user_id=episode["user_id"], **fact), graph, episode["id"])
                     report["facts_added"] += 1
         except (ValueError, TypeError):
             log.warning("Fact extraction failed during consolidation")
@@ -521,6 +589,10 @@ async def consolidate(ctx: TenantContext = Depends(tenant_context), db: Database
         key = (fact["user_id"], fact["subject"].lower(), fact["predicate"].lower(), normalized)
         if key in canonical:
             await db.execute("UPDATE facts SET valid_to=?,superseded_by=? WHERE tenant_id=? AND id=? AND valid_to IS NULL", (now(), canonical[key], ctx.tenant_id, fact["id"]))
+            duplicate = dict(await db.fetchone("SELECT * FROM facts WHERE tenant_id=? AND id=?", (ctx.tenant_id, fact["id"])))
+            replacement = dict(await db.fetchone("SELECT * FROM facts WHERE tenant_id=? AND id=?", (ctx.tenant_id, canonical[key])))
+            await write_through(graph, "upsert_fact", ctx.tenant_id, duplicate)
+            await write_through(graph, "upsert_fact", ctx.tenant_id, replacement, duplicate["id"])
             report["facts_merged"] += 1
         else:
             canonical[key] = fact["id"]
@@ -532,6 +604,7 @@ async def consolidate(ctx: TenantContext = Depends(tenant_context), db: Database
             steps = [row["content"] for row in pattern_episodes[:3]]
             await db.insert("INSERT INTO procedures(id,tenant_id,name,trigger_text,steps_json,version,success_count,updated_at) VALUES(?,?,?,?,?,1,?,?)", (proc_id, ctx.tenant_id, f"Repeated {event_type} resolution", event_type, json.dumps(steps), len(pattern_episodes), now()))
             put_vector(ctx.tenant_id, proc_id, event_type)
+            await write_through(graph, "upsert_procedure", ctx.tenant_id, dict(await db.fetchone("SELECT * FROM procedures WHERE tenant_id=? AND id=?", (ctx.tenant_id, proc_id))))
             report["procedures_created"] += 1
     procedures = await db.fetchall("SELECT id,success_count,failure_count FROM procedures WHERE tenant_id=? AND is_active=1", (ctx.tenant_id,))
     report["procedures_flagged"] = [row["id"] for row in procedures if needs_review(row["success_count"], row["failure_count"])]

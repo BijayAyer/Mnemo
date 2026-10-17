@@ -13,6 +13,7 @@ CREATE INDEX IF NOT EXISTS episodes_tenant_user ON episodes(tenant_id,user_id,ts
 CREATE TABLE IF NOT EXISTS facts(id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL, user_id TEXT NOT NULL, subject TEXT NOT NULL, predicate TEXT NOT NULL, object TEXT NOT NULL, confidence REAL NOT NULL, source_episode_id TEXT, valid_from TEXT NOT NULL, valid_to TEXT, superseded_by TEXT, embedding_id TEXT);
 CREATE INDEX IF NOT EXISTS facts_tenant_user ON facts(tenant_id,user_id,valid_from);
 CREATE TABLE IF NOT EXISTS procedures(id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL, name TEXT NOT NULL, trigger_text TEXT NOT NULL, steps_json TEXT NOT NULL, version INTEGER NOT NULL, success_count INTEGER NOT NULL DEFAULT 0, failure_count INTEGER NOT NULL DEFAULT 0, is_active INTEGER NOT NULL DEFAULT 1, updated_at TEXT NOT NULL, embedding_id TEXT);
+CREATE TABLE IF NOT EXISTS procedure_usage(tenant_id TEXT NOT NULL, procedure_id TEXT NOT NULL, agent_id TEXT NOT NULL, first_used_at TEXT NOT NULL, PRIMARY KEY(tenant_id,procedure_id,agent_id));
 CREATE TABLE IF NOT EXISTS conversations(id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL, user_id TEXT NOT NULL, session_id TEXT NOT NULL, created_at TEXT NOT NULL, UNIQUE(tenant_id,user_id,session_id));
 CREATE TABLE IF NOT EXISTS messages(id TEXT PRIMARY KEY, conversation_id TEXT NOT NULL, tenant_id TEXT NOT NULL, role TEXT NOT NULL, agent_id TEXT, content TEXT NOT NULL, ts TEXT NOT NULL);
 CREATE INDEX IF NOT EXISTS messages_tenant_conversation ON messages(tenant_id,conversation_id,ts);

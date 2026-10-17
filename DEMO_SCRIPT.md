@@ -16,6 +16,8 @@ uv run uvicorn mnemo.main:app --reload
 
 The example environment selects fake embeddings and MockLLM so this demo needs no paid API or running model.
 
+For the optional graph portion, start FalkorDB in another terminal with `docker compose up -d`, install `uv sync --extra dev --extra graph`, and launch Mnemo with `GRAPH_BACKEND=falkordb`. SQLite-only mode remains the default.
+
 ## 0:40-1:25 — Run the agents
 
 In terminal two:
@@ -44,7 +46,7 @@ curl -s -X POST http://127.0.0.1:8000/admin/tenants \
   -d '{"name":"Dashboard demo","agent_id":"triage"}'
 ```
 
-Switch through Memory graph, Timeline, Facts, Blackboard, Handoffs, Consolidation, and Metrics. To demonstrate live blackboard updates, keep Blackboard visible and run:
+Switch through Memory graph, Timeline, Facts, Blackboard, Handoffs, Consolidation, and Metrics. With FalkorDB enabled, Memory graph loads the tenant's graph neighbors, including fact supersession and episode provenance edges. To demonstrate live blackboard updates, keep Blackboard visible and run:
 
 ```sh
 curl -s -X PUT http://127.0.0.1:8000/v1/blackboard/demo \

@@ -1,0 +1,6 @@
+{
+  "status": "unavailable",
+  "backend": "falkordb",
+  "reason": "FalkorDB is not reachable; start docker compose before benchmarking",
+  "trials_requested": 30
+}

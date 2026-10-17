@@ -19,6 +19,9 @@ class Settings:
     llm_model: str = os.getenv("LLM_MODEL", "local-model")
     consolidation_interval: int = int(os.getenv("CONSOLIDATION_INTERVAL", "0"))
     summary_threshold: int = int(os.getenv("SUMMARY_THRESHOLD", "20"))
+    graph_backend: str = os.getenv("GRAPH_BACKEND", "none")
+    falkordb_host: str = os.getenv("FALKORDB_HOST", "localhost")
+    falkordb_port: int = int(os.getenv("FALKORDB_PORT", "6379"))
 
 
 settings = Settings()

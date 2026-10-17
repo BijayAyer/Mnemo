@@ -10,6 +10,8 @@ flowchart LR
 		UI[Static dashboard] --> API
 		API --> Auth[Tenant context]
 		Auth --> DB[(SQLite WAL<br/>1 writer + 4 readers)]
+		API -. best-effort projection .-> Graph[(Optional FalkorDB<br/>one graph per tenant)]
+		DB -->|rebuild command| Graph
 		API --> Embed[Embedding provider]
 		Embed --> Index[(Per-tenant FAISS index<br/>local-ml extra)]
 		API --> LLM[Mock or local OpenAI-compatible LLM]
@@ -28,6 +30,7 @@ flowchart LR
 | Shared state and handoffs | Versioned compare-and-swap blackboard, live SSE, handoff inbox and lifecycle, renewable expiring leases. |
 | High concurrency | SQLite WAL, a serialized writer connection, four independent read connections, and bounded per-tenant database operations. |
 | Tenant isolation | Hashed API keys resolve the tenant on the server; data and vector lookups filter by that tenant; foreign IDs return 404. |
+| Graph memory | Optional FalkorDB graph per tenant, written through from SQLite, traversed for related recall, and rebuildable from SQLite. |
 
 ## Setup
 
@@ -50,6 +53,26 @@ curl -s -X POST http://127.0.0.1:8000/admin/tenants \
 
 For local sentence-transformer embeddings and persisted FAISS indexes, install `uv sync --extra dev --extra local-ml` and set `EMBEDDER=sentence-transformers` in `.env`. The first embedding call downloads `all-MiniLM-L6-v2`. `EMBEDDER=lm-studio` uses the OpenAI-compatible `/embeddings` endpoint at `LLM_BASE_URL`.
 
+## How FalkorDB Is Used
+
+SQLite remains the source of truth. With `GRAPH_BACKEND=none` (the default), Mnemo does not import or contact FalkorDB. To enable the optional projection locally:
+
+```sh
+docker compose up -d
+uv sync --extra dev --extra graph
+GRAPH_BACKEND=falkordb FALKORDB_HOST=localhost FALKORDB_PORT=6379 uv run uvicorn mnemo.main:app --reload
+```
+
+Mnemo derives each graph name from the tenant ID resolved from `X-API-Key` using SHA-256; request-supplied user IDs never select a graph. Nodes represent users, agents, episodes, facts, procedures, and handoffs. Edges capture user ownership, fact provenance and supersession, performed episodes, handoffs, and procedures. Graph writes happen after SQLite commits. A graph outage is logged and does not fail the SQLite-backed request. Recall traverses up to three hops from matched records and reloads related candidates from the same tenant's SQLite rows before applying the token budget.
+
+The graph endpoints are `GET /v1/graph/neighbors?user_id=...` and `GET /v1/graph/provenance/{fact_id}`. Rebuild one tenant's projection from its SQLite records with:
+
+```sh
+GRAPH_BACKEND=falkordb uv run python -m mnemo.graph rebuild --tenant-id TENANT_UUID
+```
+
+Benchmark graph recall against vector-only recall with `GRAPH_BACKEND=falkordb uv run --extra dev --extra graph python -m benchmarks.graph_recall`. It writes `benchmarks/results/graph_recall.json`. **Measured FalkorDB results are not available from this workspace:** no Docker/container runtime or service is installed here, so the benchmark and live integration test could not run. The benchmark refuses to report results when FalkorDB is unreachable; no latency or recall figures are fabricated.
+
 Set a non-default `MNEMO_ADMIN_KEY` before exposing the service beyond localhost. Tenant API keys are generated once and only SHA-256 hashes are stored.
 
 ## Run It
@@ -67,8 +90,12 @@ It stores Alice's plan and contact preference, hands the billing issue to Billin
 Run the test suite:
 
 ```sh
-EMBEDDER=fake LLM=mock uv run --extra dev pytest
+GRAPH_BACKEND=none EMBEDDER=fake LLM=mock uv run --extra dev pytest
+docker compose up -d
+GRAPH_BACKEND=falkordb EMBEDDER=fake LLM=mock uv run --extra dev --extra graph pytest
 ```
+
+The second test command runs the live tenant-isolation, supersession, and rebuild test and requires the compose service.
 
 The dashboard is served at `/dashboard`. Its graph uses Cytoscape.js from cdnjs when online and degrades to an explanatory empty view when the library cannot load. Blackboard updates use an authenticated fetch-based SSE stream.
 
@@ -90,6 +117,7 @@ Generated benchmark artifacts live in [`benchmarks/results`](benchmarks/results)
 | CAS contention | 35,066 conflicts retried; **100%** retry success; final counters matched all **2,080** successful increments. |
 | Tenant isolation under load | **0** cross-tenant leaks; **0** lost updates. |
 | Recall | recall@1 **1.00**, recall@5 **1.00** across four session-1 questions; supersession **1/1** correct. |
+| Graph recall | Live multi-hop comparison pending an available FalkorDB service; run `benchmarks.graph_recall` to save the measurement. |
 | Adversarial isolation | **14/14** checks passed, including foreign read/update/delete and semantic search. |
 
 ![Concurrency latency percentiles](benchmarks/results/concurrency.png)
