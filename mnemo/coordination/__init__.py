@@ -1,0 +1,1 @@
+"""Shared state and agent coordination rules."""

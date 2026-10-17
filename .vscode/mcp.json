@@ -1,0 +1,21 @@
+{
+  "inputs": [
+    {
+      "id": "mnemo-api-key",
+      "type": "promptString",
+      "description": "Tenant API key for Mnemo",
+      "password": true
+    }
+  ],
+  "servers": {
+    "mnemo-memory": {
+      "type": "stdio",
+      "command": "uv",
+      "args": ["run", "python", "-m", "mnemo.mcp_server"],
+      "env": {
+        "MNEMO_API_KEY": "${input:mnemo-api-key}",
+        "MNEMO_URL": "http://127.0.0.1:8000"
+      }
+    }
+  }
+}

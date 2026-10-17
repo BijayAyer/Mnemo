@@ -1,0 +1,23 @@
+{
+  "duration_seconds": 61.27,
+  "agents": 100,
+  "tenants": 5,
+  "requests": 85961,
+  "throughput_rps": 1403.06,
+  "p50_ms": 6.74,
+  "p95_ms": 195.17,
+  "p99_ms": 298.48,
+  "error_rate": 0.0,
+  "cas_conflicts_retried": 35066,
+  "cas_retry_success_rate": 1.0,
+  "successful_increments": 2080,
+  "final_counters": [
+    417,
+    415,
+    416,
+    417,
+    415
+  ],
+  "zero_lost_updates": true,
+  "zero_cross_tenant_leakage": true
+}

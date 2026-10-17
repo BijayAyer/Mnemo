@@ -1,0 +1,1 @@
+"""Repeatable local benchmarks for Mnemo."""

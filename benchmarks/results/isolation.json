@@ -1,0 +1,86 @@
+[
+  {
+    "attack": "missing credential",
+    "status": 401,
+    "expected": 401,
+    "passed": true
+  },
+  {
+    "attack": "read foreign episode",
+    "status": 404,
+    "expected": 404,
+    "passed": true
+  },
+  {
+    "attack": "update foreign episode",
+    "status": 404,
+    "expected": 404,
+    "passed": true
+  },
+  {
+    "attack": "delete foreign episode",
+    "status": 404,
+    "expected": 404,
+    "passed": true
+  },
+  {
+    "attack": "read foreign fact",
+    "status": 404,
+    "expected": 404,
+    "passed": true
+  },
+  {
+    "attack": "update foreign fact",
+    "status": 404,
+    "expected": 404,
+    "passed": true
+  },
+  {
+    "attack": "delete foreign fact",
+    "status": 404,
+    "expected": 404,
+    "passed": true
+  },
+  {
+    "attack": "read foreign blackboard",
+    "status": 404,
+    "expected": 404,
+    "passed": true
+  },
+  {
+    "attack": "write using foreign version",
+    "status": 409,
+    "expected": 409,
+    "passed": true
+  },
+  {
+    "attack": "delete foreign blackboard",
+    "status": 404,
+    "expected": 404,
+    "passed": true
+  },
+  {
+    "attack": "read foreign handoff",
+    "status": 404,
+    "expected": 404,
+    "passed": true
+  },
+  {
+    "attack": "accept foreign handoff",
+    "status": 404,
+    "expected": 404,
+    "passed": true
+  },
+  {
+    "attack": "delete foreign handoff",
+    "status": 404,
+    "expected": 404,
+    "passed": true
+  },
+  {
+    "attack": "search ranking isolation",
+    "status": 200,
+    "expected": 200,
+    "passed": true
+  }
+]

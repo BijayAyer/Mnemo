@@ -1,0 +1,83 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Mnemo | Agent memory</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/cytoscape/3.30.4/cytoscape.min.js"></script>
+<style>
+:root {
+  color-scheme: light;
+  --bg: #fff;
+  --surface: #fff;
+  --text: #111;
+  --muted: #666;
+  --line: #dedede;
+  --strong-line: #222;
+  --sans: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  --mono: ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--bg); color: var(--text); font: 14px/1.5 var(--sans); }
+header { display: flex; align-items: center; justify-content: space-between; gap: 24px; padding: 18px clamp(18px, 5vw, 56px); border-bottom: 1px solid var(--line); }
+.brand { display: flex; align-items: center; gap: 12px; }
+.mark { display: grid; place-items: center; width: 34px; height: 34px; border: 1px solid var(--strong-line); border-radius: 4px; font: 600 18px/1 var(--sans); }
+h1 { margin: 0; font: 600 22px/1.2 var(--sans); }
+header p { margin: 3px 0 0; color: var(--muted); font: 11px/1.4 var(--mono); }
+.keybar { display: flex; gap: 8px; width: min(52%, 520px); }
+input, button { min-height: 38px; padding: 8px 11px; border: 1px solid var(--line); border-radius: 4px; background: var(--surface); color: var(--text); font: inherit; }
+input:focus-visible, button:focus-visible { outline: 2px solid #111; outline-offset: 2px; }
+input { min-width: 0; flex: 1; }
+button { cursor: pointer; }
+button:hover { border-color: var(--strong-line); background: #f7f7f7; }
+nav { display: flex; gap: 2px; padding: 0 clamp(12px, 5vw, 56px); overflow-x: auto; border-bottom: 1px solid var(--line); }
+nav button { min-height: 46px; padding: 12px 14px; border: 0; border-bottom: 2px solid transparent; border-radius: 0; background: transparent; color: var(--muted); white-space: nowrap; }
+nav button[aria-selected="true"] { border-bottom-color: #111; color: #111; }
+main { width: min(100%, 1320px); margin: 0 auto; padding: 28px clamp(18px, 5vw, 56px); }
+.toolbar { display: flex; align-items: center; justify-content: space-between; gap: 16px; margin-bottom: 20px; }
+.toolbar h2 { margin: 0; font: 600 22px/1.3 var(--sans); }
+.toolbar small, .hint { color: var(--muted); }
+.content { min-height: 340px; padding-top: 18px; border-top: 1px solid var(--line); }
+.grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(230px, 1fr)); gap: 10px; }
+article { min-height: 0; padding: 15px; overflow-wrap: anywhere; border: 1px solid var(--line); border-radius: 4px; background: var(--surface); }
+article h3 { margin: 0 0 9px; font: 600 14px/1.4 var(--sans); }
+pre { margin: 0; color: #333; font: 12px/1.6 var(--mono); white-space: pre-wrap; overflow-wrap: anywhere; }
+.metric { color: #111; font: 600 28px/1.2 var(--sans); }
+.row { display: flex; align-items: center; gap: 8px; }
+.row input { max-width: 220px; }
+.state { display: inline-block; font-size: 11px; text-transform: uppercase; }
+.error { font-weight: 600; }
+#graph { height: 520px; border: 1px solid var(--line); background: #fff; }
+footer { padding: 18px clamp(18px, 5vw, 56px); border-top: 1px solid var(--line); color: var(--muted); font: 11px/1.4 var(--mono); }
+@media (max-width: 650px) {
+  header { align-items: flex-start; flex-direction: column; }
+  .keybar { width: 100%; }
+  .toolbar { align-items: flex-start; flex-direction: column; }
+  nav { padding: 0 10px; }
+  nav button { padding: 12px; }
+}
+</style>
+</head>
+<body>
+<header><div class="brand"><div class="mark" aria-hidden="true">M</div><div><h1>Mnemo</h1><p>MEMORY + COORDINATION / LOCAL INSTANCE</p></div></div><div class="keybar"><input id="api-key" type="password" aria-label="Tenant API key" placeholder="Tenant API key"><button id="connect" title="Connect with tenant key">Connect</button></div></header>
+<nav aria-label="Dashboard sections"><button aria-selected="true" data-tab="graph">Memory graph</button><button data-tab="timeline">Timeline</button><button data-tab="facts">Facts</button><button data-tab="blackboard">Blackboard</button><button data-tab="handoffs">Handoffs</button><button data-tab="consolidation">Consolidation</button><button data-tab="metrics">Metrics</button></nav>
+<main><div class="toolbar"><div><h2 id="title">Memory graph</h2><small id="status">Connect a tenant key to load memory.</small></div><div class="row"><input id="user-id" aria-label="User ID filter" placeholder="Filter by user ID"><button id="refresh" title="Refresh current view">Refresh</button></div></div><section class="content" id="content" aria-live="polite"></section></main>
+<footer>LOCAL INSTANCE · TENANT-KEY AUTH</footer>
+<script>
+const tabs={graph:'Memory graph',timeline:'Timeline',facts:'Facts',blackboard:'Blackboard',handoffs:'Handoffs',consolidation:'Consolidation',metrics:'Metrics'};let active='graph',eventSource=null;
+const key=()=>document.querySelector('#api-key').value.trim(),user=()=>document.querySelector('#user-id').value.trim();
+async function api(path,options={}){const response=await fetch(path,{...options,headers:{'X-API-Key':key(),...(options.headers||{})}});if(!response.ok)throw new Error(`${response.status} ${await response.text()}`);return response.json()}
+async function watchBlackboard(content){const response=await fetch('/v1/blackboard/stream',{headers:{'X-API-Key':key()}});if(!response.ok)throw new Error(`Stream ${response.status}`);const reader=response.body.getReader(),decoder=new TextDecoder();let buffer='';for(;;){const {done,value}=await reader.read();if(done)return;buffer+=decoder.decode(value,{stream:true});const blocks=buffer.split('\n\n');buffer=blocks.pop();for(const block of blocks){const line=block.split('\n').find(item=>item.startsWith('data: '));if(line){const item=JSON.parse(line.slice(6));content.prepend(card(item.key,item));document.querySelector('#status').textContent=`Live update · ${item.key} v${item.version}`}}}}
+function card(title,value){const node=document.createElement('article'),heading=document.createElement('h3'),pre=document.createElement('pre');heading.textContent=title;pre.textContent=typeof value==='string'?value:JSON.stringify(value,null,2);node.append(heading,pre);return node}
+function list(items){const grid=document.createElement('div');grid.className='grid';if(!items.length)grid.append(card('No records','Nothing to show for this tenant yet.'));else items.forEach((item,i)=>grid.append(card(item.subject?`${item.subject} / ${item.predicate}`:item.name||item.key||item.event_type||`Record ${i+1}`,item)));return grid}
+async function render(){document.querySelector('#title').textContent=tabs[active];const content=document.querySelector('#content');content.replaceChildren();try{if(!key())throw new Error('Enter a tenant API key to connect.');let data;
+if(active==='graph'){const [facts,episodes,procedures]=await Promise.all([api('/v1/facts'+(user()?`?user_id=${encodeURIComponent(user())}`:'')),api('/v1/episodes'+(user()?`?user_id=${encodeURIComponent(user())}`:'')),api('/v1/procedures')]);const nodes=[...facts.map(x=>({data:{id:x.id,label:`${x.subject}: ${x.object}`,kind:'fact'}})),...episodes.map(x=>({data:{id:x.id,label:x.event_type,kind:'episode'}})),...procedures.map(x=>({data:{id:x.id,label:x.name,kind:'procedure'}}))];if(window.cytoscape){const div=document.createElement('div');div.id='graph';content.append(div);cytoscape({container:div,elements:nodes,style:[{selector:'node',style:{label:'data(label)','background-color':'#111',color:'#fff','font-size':10,'text-wrap':'wrap','text-max-width':110,width:18,height:18}},{selector:'node[kind="episode"]',style:{'background-color':'#fff',color:'#000','border-width':1,'border-color':'#000'}},{selector:'node[kind="procedure"]',style:{'background-color':'#777',color:'#fff'}}],layout:{name:'cose',animate:false}})}else content.append(card('Graph library unavailable','Cytoscape.js did not load. Use Timeline and Facts to inspect records.'))}
+if(active==='timeline'){data=await api('/v1/episodes'+(user()?`?user_id=${encodeURIComponent(user())}`:''));content.append(list(data))}
+if(active==='facts'){data=await api('/v1/facts'+(user()?`?user_id=${encodeURIComponent(user())}`:''));content.append(list(data))}
+if(active==='blackboard'){data=await api('/v1/blackboard');content.append(list(data));if(eventSource)eventSource.close();eventSource=watchBlackboard(content)}
+if(active==='handoffs'){data=await api('/v1/handoffs/inbox');content.append(list(data))}
+if(active==='consolidation'){data=await api('/v1/consolidate/reports');content.append(list(data))}
+if(active==='metrics'){data=await api('/v1/metrics');const grid=document.createElement('div');grid.className='grid';for(const [name,value] of Object.entries(data)){const item=document.createElement('article'),label=document.createElement('h3'),metric=document.createElement('div');label.textContent=name.replaceAll('_',' ');metric.className='metric';metric.textContent=typeof value==='number'?value.toFixed(name.endsWith('ms')?1:0):value;item.append(label,metric);grid.append(item)}content.append(grid)}
+document.querySelector('#status').textContent='Connected · tenant scoped';}catch(error){content.append(card('Unable to load',error.message));document.querySelector('#status').textContent='Connection issue'}}
+document.querySelectorAll('nav button').forEach(button=>button.addEventListener('click',()=>{active=button.dataset.tab;document.querySelectorAll('nav button').forEach(tab=>tab.setAttribute('aria-selected',String(tab===button)));render()}));document.querySelector('#connect').addEventListener('click',render);document.querySelector('#refresh').addEventListener('click',render);document.querySelector('#user-id').addEventListener('keydown',event=>{if(event.key==='Enter')render()});
+</script>
+</body></html>

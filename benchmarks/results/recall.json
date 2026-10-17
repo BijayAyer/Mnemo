@@ -1,0 +1,9 @@
+{
+  "facts": 202,
+  "sessions": 50,
+  "queries": 4,
+  "recall_at_1": 1.0,
+  "recall_at_5": 1.0,
+  "supersession_correct": 1,
+  "supersession_trials": 1
+}
